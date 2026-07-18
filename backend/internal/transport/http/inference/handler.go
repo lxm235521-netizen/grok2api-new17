@@ -2,6 +2,9 @@ package inference
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +12,8 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -68,11 +73,17 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/images/generations", h.generateImage)
 	router.POST("/images/edits", h.editImage)
 	router.POST("/videos/generations", h.generateVideo)
+	router.POST("/videos", h.generateVideoUnified)
 	router.GET("/videos/:requestId", h.getVideo)
-	router.GET("/videos/:requestId/content", h.getVideoContent)
+
 	router.POST("/responses/compact", h.compactResponse)
 	router.GET("/responses/:responseId", h.getResponse)
 	router.DELETE("/responses/:responseId", h.deleteResponse)
+}
+
+// RegisterPublic 在 engine 上注册无需客户端鉴权的公开路由。
+func (h *Handler) RegisterPublic(engine *gin.Engine) {
+	engine.GET("/v1/videos/:requestId/content", h.getVideoContentPublic)
 }
 
 type responsesRequest struct {
@@ -139,8 +150,11 @@ type videoGenerationRequest struct {
 	Prompt          string                 `json:"prompt"`
 	User            *string                `json:"user"`
 	Duration        json.RawMessage        `json:"duration"`
+	Seconds         json.RawMessage        `json:"seconds"`
 	AspectRatio     string                 `json:"aspect_ratio"`
+	Size            string                 `json:"size"`
 	Resolution      string                 `json:"resolution"`
+	ImageURL        string                 `json:"image_url"`
 	Image           *videoGenerationImage  `json:"image"`
 	ReferenceImages []videoGenerationImage `json:"reference_images"`
 	Output          json.RawMessage        `json:"output"`
@@ -533,18 +547,47 @@ func (h *Handler) generateVideo(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "unsupported_parameter", "当前 Grok Web Provider 不支持 storage_options")
 		return
 	}
+
+	// ---- 时长解析：duration 优先，seconds 作为备选 ----
 	duration, err := parseVideoDuration(request.Duration)
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	if hasJSONValue(request.Seconds) {
+		secondsValue, _, err := parseOptionalVideoInteger(request.Seconds)
+		if err != nil || secondsValue < 1 || secondsValue > 15 {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "seconds 必须是 1 到 15 的整数")
+			return
+		}
+		duration = secondsValue
+	}
+
+	// ---- 模型兼容：grok-imagine-video-1.5-preview → grok-imagine-video-1.5 ----
 	model := strings.TrimSpace(request.Model)
-	prompt := strings.TrimSpace(request.Prompt)
 	if model == "" {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "视频生成缺少有效 model")
 		return
 	}
+	if model == "grok-imagine-video-1.5-preview" {
+		model = "grok-imagine-video-1.5"
+	}
+
+	prompt := strings.TrimSpace(request.Prompt)
+
+	// ---- 宽高比：aspect_ratio 优先，size 作为备选 ----
 	aspectRatio := strings.TrimSpace(request.AspectRatio)
+	if aspectRatio == "" {
+		size := strings.TrimSpace(request.Size)
+		if size != "" {
+			ratio, ok := parseSizeToAspectRatio(size)
+			if !ok {
+				writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "size 格式无效，请使用 WxH（如 1920x1080），且宽高比需在支持列表中")
+				return
+			}
+			aspectRatio = ratio
+		}
+	}
 	if aspectRatio == "" {
 		aspectRatio = "16:9"
 	}
@@ -552,6 +595,7 @@ func (h *Handler) generateVideo(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "aspect_ratio 必须是 1:1、16:9、9:16、4:3、3:4、3:2 或 2:3")
 		return
 	}
+
 	resolution := strings.ToLower(strings.TrimSpace(request.Resolution))
 	if resolution == "" {
 		resolution = "720p"
@@ -560,15 +604,25 @@ func (h *Handler) generateVideo(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "resolution 必须是 480p、720p 或 1080p")
 		return
 	}
+
+	// ---- 收集参考图片：image_url（简易字段）+ image / reference_images ----
+	referenceURLs := make([]string, 0)
+	if imageURL := strings.TrimSpace(request.ImageURL); imageURL != "" {
+		resolved, err := resolveImageReference(imageURL)
+		if err != nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+		referenceURLs = append(referenceURLs, resolved)
+	}
 	inputs := append([]videoGenerationImage(nil), request.ReferenceImages...)
 	if request.Image != nil {
 		inputs = append([]videoGenerationImage{*request.Image}, inputs...)
 	}
-	if len(inputs) > 8 {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "image 与 reference_images 合计不能超过 8 张")
+	if len(referenceURLs)+len(inputs) > 8 {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "image_url、image 与 reference_images 合计不能超过 8 张")
 		return
 	}
-	referenceURLs := make([]string, 0, len(inputs))
 	for _, input := range inputs {
 		if strings.TrimSpace(input.FileID) != "" {
 			writeOpenAIError(c, http.StatusBadRequest, "unsupported_parameter", "当前暂不支持 image.file_id，请使用 image.url")
@@ -579,12 +633,19 @@ func (h *Handler) generateVideo(c *gin.Context) {
 			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "每个 image 都必须提供有效 url")
 			return
 		}
-		referenceURLs = append(referenceURLs, urlValue)
+		resolved, err := resolveImageReference(urlValue)
+		if err != nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+		referenceURLs = append(referenceURLs, resolved)
 	}
+
 	if prompt == "" && len(referenceURLs) == 0 {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "文本生视频必须提供 prompt；图片生视频可以省略 prompt")
 		return
 	}
+
 	clientKey, requestID, ok := requestIdentity(c)
 	if !ok {
 		return
@@ -599,6 +660,239 @@ func (h *Handler) generateVideo(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"request_id": job.ID})
+}
+
+const (
+	formVideoMaxFileBytes = 20 << 20
+	formVideoMaxFiles     = 8
+)
+
+// generateVideoUnified 根据 Content-Type 将请求分发到 JSON 或 multipart 处理器。
+func (h *Handler) generateVideoUnified(c *gin.Context) {
+	mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
+	if err == nil && strings.EqualFold(mediaType, "multipart/form-data") {
+		h.generateVideoForm(c)
+		return
+	}
+	h.generateVideo(c)
+}
+
+// generateVideoForm 处理 multipart/form-data 格式的视频生成请求。
+// 文件直接转为 data URI，走现有的 JSON 下游管道，零下游改动。
+func (h *Handler) generateVideoForm(c *gin.Context) {
+	mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
+	if err != nil || !strings.EqualFold(mediaType, "multipart/form-data") {
+		writeOpenAIError(c, http.StatusUnsupportedMediaType, "invalid_request", "视频生成表单仅支持 multipart/form-data")
+		return
+	}
+
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, h.maxBodyBytes)
+	form, err := c.MultipartForm()
+	if err != nil {
+		var sizeErr *http.MaxBytesError
+		if errors.As(err, &sizeErr) {
+			writeOpenAIError(c, http.StatusRequestEntityTooLarge, "invalid_request", "表单总大小超过限制")
+			return
+		}
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "表单数据无效: "+err.Error())
+		return
+	}
+	defer form.RemoveAll()
+
+	model := strings.TrimSpace(c.PostForm("model"))
+	if model == "" {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "视频生成缺少有效 model")
+		return
+	}
+	prompt := strings.TrimSpace(c.PostForm("prompt"))
+
+	secondsStr := strings.TrimSpace(c.PostForm("seconds"))
+	duration := 8
+	if secondsStr != "" {
+		duration, err = strconv.Atoi(secondsStr)
+		if err != nil || duration < 1 || duration > 15 {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "seconds 必须是 1 到 15 的整数")
+			return
+		}
+	}
+
+	resolutionName := strings.ToLower(strings.TrimSpace(c.PostForm("resolution_name")))
+	if resolutionName == "" {
+		resolutionName = "720p"
+	}
+	if resolutionName != "480p" && resolutionName != "720p" && resolutionName != "1080p" {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "resolution_name 必须是 480p、720p 或 1080p")
+		return
+	}
+
+	size := strings.TrimSpace(c.PostForm("size"))
+	aspectRatio := ""
+	if size != "" {
+		ratio, ok := parseSizeToAspectRatio(size)
+		if !ok {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "size 格式无效，请使用 WxH（如 1920x1080），且宽高比需在支持列表中")
+			return
+		}
+		aspectRatio = ratio
+	}
+	if aspectRatio == "" {
+		aspectRatio = "16:9"
+	}
+
+	files := form.File["input_reference[]"]
+	if len(files) > formVideoMaxFiles {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", fmt.Sprintf("input_reference 文件合计不能超过 %d 个", formVideoMaxFiles))
+		return
+	}
+
+	referenceURLs := make([]string, 0, len(files))
+	for _, fileHeader := range files {
+		file, openErr := fileHeader.Open()
+		if openErr != nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "无法读取上传文件: "+openErr.Error())
+			return
+		}
+		raw, readErr := io.ReadAll(io.LimitReader(file, formVideoMaxFileBytes+1))
+		file.Close()
+		if readErr != nil || int64(len(raw)) > formVideoMaxFileBytes {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", fmt.Sprintf("上传文件超过 %d MiB", formVideoMaxFileBytes>>20))
+			return
+		}
+		if len(raw) == 0 {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "上传文件为空")
+			return
+		}
+		mimeType := http.DetectContentType(raw)
+		if !strings.HasPrefix(mimeType, "image/") {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "上传文件不是有效图片格式")
+			return
+		}
+		token, tokenErr := generateToken(32)
+		if tokenErr != nil {
+			writeOpenAIError(c, http.StatusInternalServerError, "server_error", "生成图片令牌失败")
+			return
+		}
+		dir := "/app/data/video-references"
+		if mkErr := os.MkdirAll(dir, 0700); mkErr != nil {
+			writeOpenAIError(c, http.StatusInternalServerError, "server_error", "创建临时文件目录失败")
+			return
+		}
+		filePath := filepath.Join(dir, token)
+		if writeErr := os.WriteFile(filePath, raw, 0600); writeErr != nil {
+			writeOpenAIError(c, http.StatusInternalServerError, "server_error", "暂存上传文件失败")
+			return
+		}
+		refURL := "grok2api-file://" + token
+		referenceURLs = append(referenceURLs, refURL)
+	}
+
+	if prompt == "" && len(referenceURLs) == 0 {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "文本生视频必须提供 prompt；图片生视频可以省略 prompt")
+		return
+	}
+
+	clientKey, requestID, ok := requestIdentity(c)
+	if !ok {
+		return
+	}
+	job, err := h.gateway.CreateVideo(c.Request.Context(), gateway.VideoInput{
+		RequestID: requestID, ClientKey: clientKey, PublicModel: model,
+		Prompt: prompt, Duration: duration, AspectRatio: aspectRatio, Resolution: resolutionName,
+		ReferenceURLs: referenceURLs,
+	})
+	if err != nil {
+		writeGatewayError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"request_id": job.ID})
+}
+
+func gcd(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+func parseSizeToAspectRatio(size string) (string, bool) {
+	parts := strings.Split(size, "x")
+	if len(parts) != 2 {
+		return "", false
+	}
+	w, errW := strconv.Atoi(strings.TrimSpace(parts[0]))
+	h, errH := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if errW != nil || errH != nil || w <= 0 || h <= 0 {
+		return "", false
+	}
+	d := gcd(w, h)
+	ratio := fmt.Sprintf("%d:%d", w/d, h/d)
+	if validVideoAspectRatio(ratio) {
+		return ratio, true
+	}
+	return "", false
+}
+
+func generateToken(bytes int) (string, error) {
+	raw := make([]byte, bytes)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw), nil
+}
+
+const (
+	resolveImageMaxBytes     = 20 << 20
+	// inputJSONSafeBytes 是 data URI 可直接存入 input_json 的安全上限，
+	// 减去 JSON 包装开销后仍低于 1 MiB 列约束。
+	inputJSONSafeBytes       = 900 << 10
+)
+
+// resolveImageReference 将 image_url 值统一解析为可供 worker 使用的引用 URL。
+// 小于 inputJSONSafeBytes 的 data URI 直接透传，否则落盘为 grok2api-file:// 令牌。
+func resolveImageReference(value string) (string, error) {
+	lower := strings.ToLower(value)
+	if strings.HasPrefix(lower, "grok2api-file://") || strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "http://") {
+		return value, nil
+	}
+	if !strings.HasPrefix(lower, "data:image/") {
+		return "", fmt.Errorf("image_url 必须是 HTTPS URL 或 data:image/...;base64 数据 URI")
+	}
+	header, encoded, ok := strings.Cut(value, ",")
+	if !ok || !strings.Contains(strings.ToLower(header), ";base64") {
+		return "", fmt.Errorf("image_url data URI 必须是 Base64 编码的图片")
+	}
+	encoded = strings.Join(strings.Fields(encoded), "")
+	if encoded == "" || int64(base64.StdEncoding.DecodedLen(len(encoded))) > resolveImageMaxBytes {
+		return "", fmt.Errorf("image_url 图片为空或超过 %d MiB", resolveImageMaxBytes>>20)
+	}
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		raw, err = base64.RawStdEncoding.DecodeString(encoded)
+	}
+	if err != nil || len(raw) == 0 || int64(len(raw)) > resolveImageMaxBytes {
+		return "", fmt.Errorf("image_url Base64 无效或图片超过 %d MiB", resolveImageMaxBytes>>20)
+	}
+	mimeType := http.DetectContentType(raw)
+	if !strings.HasPrefix(mimeType, "image/") {
+		return "", fmt.Errorf("image_url 解码后不是有效图片格式")
+	}
+	// 小图直接透传，兼容 Build provider 无法读取 grok2api-file:// 的限制。
+	if len(value) <= inputJSONSafeBytes {
+		return value, nil
+	}
+	token, tokenErr := generateToken(32)
+	if tokenErr != nil {
+		return "", fmt.Errorf("生成图片令牌失败")
+	}
+	dir := "/app/data/video-references"
+	if mkErr := os.MkdirAll(dir, 0700); mkErr != nil {
+		return "", fmt.Errorf("创建临时文件目录失败")
+	}
+	filePath := filepath.Join(dir, token)
+	if writeErr := os.WriteFile(filePath, raw, 0600); writeErr != nil {
+		return "", fmt.Errorf("暂存图片文件失败")
+	}
+	return "grok2api-file://" + token, nil
 }
 
 func (h *Handler) getVideo(c *gin.Context) {
@@ -632,6 +926,16 @@ func (h *Handler) getVideoContent(c *gin.Context) {
 		return
 	}
 	body, contentType, size, err := h.gateway.OpenVideoContent(c.Request.Context(), strings.TrimSpace(c.Param("requestId")), clientKey)
+	if err != nil {
+		writeGatewayError(c, err)
+		return
+	}
+	defer func() { _ = body.Close() }()
+	writeVideoContent(c, body, contentType, size)
+}
+
+func (h *Handler) getVideoContentPublic(c *gin.Context) {
+	body, contentType, size, err := h.gateway.OpenVideoContentPublic(c.Request.Context(), strings.TrimSpace(c.Param("requestId")))
 	if err != nil {
 		writeGatewayError(c, err)
 		return
@@ -738,7 +1042,7 @@ func videoGenerationResponse(job mediadomain.Job, contentURLs ...string) gin.H {
 			videoURL = contentURLs[0]
 		}
 		return gin.H{
-			"status": "done", "model": job.Model, "progress": 100,
+			"status": "completed", "model": job.Model, "progress": 100,
 			"video": gin.H{"url": videoURL, "duration": job.Seconds, "respect_moderation": true},
 		}
 	case mediadomain.StatusFailed:

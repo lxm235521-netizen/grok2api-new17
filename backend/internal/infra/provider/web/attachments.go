@@ -10,7 +10,10 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -108,6 +111,9 @@ func (a *Adapter) prepareChatAttachments(ctx context.Context, cfg Config, lease 
 func (a *Adapter) loadChatImage(ctx context.Context, lease *egress.Lease, input string, maxBytes int64) (provider.ImageInput, error) {
 	if strings.HasPrefix(strings.ToLower(input), "data:") {
 		return parseChatImageDataURI(input, maxBytes)
+	}
+	if strings.HasPrefix(strings.ToLower(input), "grok2api-file://") {
+		return readLocalVideoReference(input, maxBytes)
 	}
 	target, err := validateRemoteImageURL(ctx, input)
 	if err != nil {
@@ -470,4 +476,26 @@ func imageExtension(mimeType string) string {
 	default:
 		return ".bin"
 	}
+}
+
+var videoRefTokenPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+func readLocalVideoReference(input string, maxBytes int64) (provider.ImageInput, error) {
+	token := strings.TrimPrefix(input, "grok2api-file://")
+	if !videoRefTokenPattern.MatchString(token) {
+		return provider.ImageInput{}, fmt.Errorf("%w: 无效的内部引用令牌", errInvalidChatImage)
+	}
+	filePath := filepath.Join("/app/data/video-references", filepath.Clean(token))
+	raw, err := os.ReadFile(filePath)
+	if err != nil {
+		return provider.ImageInput{}, fmt.Errorf("%w: 读取内部引用失败", errInvalidChatImage)
+	}
+	if int64(len(raw)) > maxBytes {
+		return provider.ImageInput{}, fmt.Errorf("%w: 图片超过 %d MiB", errInvalidChatImage, maxBytes>>20)
+	}
+	mimeType, err := validatedImageMIME(raw, "")
+	if err != nil {
+		return provider.ImageInput{}, err
+	}
+	return provider.ImageInput{Filename: token, MIMEType: mimeType, Data: raw}, nil
 }

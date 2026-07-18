@@ -112,10 +112,25 @@ func (s *Service) OpenVideoContent(ctx context.Context, id string, key clientkey
 	if err != nil {
 		return nil, "", 0, err
 	}
+	return s.openVideoContent(ctx, job)
+}
+
+// OpenVideoContentPublic 无需客户端鉴权即可获取视频内容，用于公开下载链接。
+func (s *Service) OpenVideoContentPublic(ctx context.Context, id string) (io.ReadCloser, string, int64, error) {
+	if s.mediaJobs == nil {
+		return nil, "", 0, ErrResponseNotFound
+	}
+	job, err := s.mediaJobs.GetMediaJobByID(ctx, id)
+	if err != nil {
+		return nil, "", 0, ErrResponseNotFound
+	}
+	return s.openVideoContent(ctx, job)
+}
+
+func (s *Service) openVideoContent(ctx context.Context, job media.Job) (io.ReadCloser, string, int64, error) {
 	if job.Status != media.StatusCompleted {
 		return nil, "", 0, fmt.Errorf("视频内容尚未可用")
 	}
-	// 本地资产优先：XAI ZDR 上传完成后不经公网回环下载。
 	if job.ResultAssetID != "" && s.mediaAssets != nil {
 		asset, body, openErr := s.mediaAssets.OpenVideo(ctx, job.ResultAssetID)
 		if openErr == nil {

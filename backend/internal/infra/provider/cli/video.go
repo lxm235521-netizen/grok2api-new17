@@ -3,11 +3,14 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -284,7 +287,11 @@ func buildVideoCreatePayload(request provider.VideoRequest, uploadURL string) (m
 		if imageURL == "" {
 			return nil, fmt.Errorf("视频首图 URL 不能为空")
 		}
-		payload["image"] = map[string]any{"image_url": imageURL}
+		resolved, err := resolveBuildImageURL(imageURL)
+		if err != nil {
+			return nil, err
+		}
+		payload["image"] = map[string]any{"image_url": resolved}
 	}
 	if _, hasPrompt := payload["prompt"]; !hasPrompt {
 		if _, hasImage := payload["image"]; !hasImage {
@@ -295,6 +302,28 @@ func buildVideoCreatePayload(request provider.VideoRequest, uploadURL string) (m
 		payload["output"] = map[string]any{"upload_url": uploadURL}
 	}
 	return payload, nil
+}
+
+var buildInternalRefPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+func resolveBuildImageURL(value string) (string, error) {
+	if !strings.HasPrefix(strings.ToLower(value), "grok2api-file://") {
+		return value, nil
+	}
+	token := strings.TrimPrefix(value, "grok2api-file://")
+	if !buildInternalRefPattern.MatchString(token) {
+		return "", fmt.Errorf("无效的内部引用令牌")
+	}
+	filePath := filepath.Join("/app/data/video-references", filepath.Clean(token))
+	raw, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", fmt.Errorf("读取视频参考图片: %w", err)
+	}
+	mimeType := http.DetectContentType(raw)
+	if !strings.HasPrefix(mimeType, "image/") {
+		return "", fmt.Errorf("视频参考图片不是有效图片格式")
+	}
+	return fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(raw)), nil
 }
 
 func (a *Adapter) pollVideoJob(ctx context.Context, credential account.Credential, accessToken, base, jobID, assetID string, progress func(int)) (provider.VideoResult, error) {
