@@ -1150,11 +1150,15 @@ func (a *Adapter) uploadFileWithFallback(ctx context.Context, cfg Config, lease 
 	if directAvailable {
 		uploaded, err := a.uploadFileV2Direct(ctx, cfg, lease, token, file, referer, fileSource)
 		var unsupported *directFileUploadUnsupportedError
-		if !errors.As(err, &unsupported) {
-			return uploaded, true, err
+		if errors.As(err, &unsupported) {
+			a.log().Warn("web_file_upload_v2_unsupported", "status", unsupported.statusCode)
+			directAvailable = false
+		} else if err == nil {
+			return uploaded, true, nil
+		} else {
+			a.log().Warn("web_file_upload_v2_failed_fallback_to_legacy", "err", err)
+			directAvailable = false
 		}
-		a.log().Warn("web_file_upload_v2_unsupported", "status", unsupported.statusCode)
-		directAvailable = false
 	}
 	uploaded, err := a.uploadFileLegacy(ctx, cfg, lease, token, file, referer)
 	return uploaded, directAvailable, err
