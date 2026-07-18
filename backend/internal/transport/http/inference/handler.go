@@ -659,7 +659,7 @@ func (h *Handler) generateVideo(c *gin.Context) {
 		writeGatewayError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"request_id": job.ID})
+	c.JSON(http.StatusOK, videoTaskResponse(job))
 }
 
 const (
@@ -804,7 +804,7 @@ func (h *Handler) generateVideoForm(c *gin.Context) {
 		writeGatewayError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"request_id": job.ID})
+	c.JSON(http.StatusOK, videoTaskResponse(job))
 }
 
 func gcd(a, b int) int {
@@ -1034,25 +1034,75 @@ func validImageEditSize(value string) bool {
 	}
 }
 
-func videoGenerationResponse(job mediadomain.Job, contentURLs ...string) gin.H {
+func aspectRatioToSize(ratio string) string {
+	switch ratio {
+	case "1:1":
+		return "720x720"
+	case "16:9":
+		return "1280x720"
+	case "9:16":
+		return "720x1280"
+	case "4:3":
+		return "1024x768"
+	case "3:4":
+		return "768x1024"
+	case "3:2":
+		return "1080x720"
+	case "2:3":
+		return "720x1080"
+	default:
+		return "1280x720"
+	}
+}
+
+func videoTaskResponse(job mediadomain.Job, contentURLs ...string) gin.H {
+	response := gin.H{
+		"id":         job.ID,
+		"task_id":    job.ID,
+		"object":     "video",
+		"model":      job.Model,
+		"status":     string(job.Status),
+		"progress":   job.Progress,
+		"created_at": job.CreatedAt.Unix(),
+		"seconds":    strconv.Itoa(job.Seconds),
+		"size":       aspectRatioToSize(job.Size),
+	}
 	switch job.Status {
 	case mediadomain.StatusCompleted:
-		videoURL := job.UpstreamURL
-		if len(contentURLs) > 0 && contentURLs[0] != "" {
-			videoURL = contentURLs[0]
+		response["status"] = "completed"
+		response["progress"] = 100
+		response["video"] = gin.H{
+			"url":               firstNonEmpty(contentURLs...),
+			"duration":          job.Seconds,
+			"respect_moderation": true,
 		}
-		return gin.H{
-			"status": "completed", "model": job.Model, "progress": 100,
-			"video": gin.H{"url": videoURL, "duration": job.Seconds, "respect_moderation": true},
+		if job.UpstreamURL != "" && len(contentURLs) == 0 {
+			response["video"] = gin.H{
+				"url":               job.UpstreamURL,
+				"duration":          job.Seconds,
+				"respect_moderation": true,
+			}
 		}
 	case mediadomain.StatusFailed:
-		return gin.H{
-			"status": "failed",
-			"error":  gin.H{"code": officialVideoErrorCode(job.ErrorCode), "message": job.ErrorMessage},
-		}
+		response["status"] = "failed"
+		response["error"] = gin.H{"code": officialVideoErrorCode(job.ErrorCode), "message": job.ErrorMessage}
 	default:
-		return gin.H{"status": "pending", "model": job.Model, "progress": min(99, max(0, job.Progress))}
+		response["progress"] = min(99, max(0, job.Progress))
 	}
+	return response
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func videoGenerationResponse(job mediadomain.Job, contentURLs ...string) gin.H {
+	return videoTaskResponse(job, contentURLs...)
 }
 
 func officialVideoErrorCode(value string) string {
