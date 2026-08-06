@@ -788,6 +788,18 @@ func TestOnlyChatModelsExposeRateLimitModes(t *testing.T) {
 	}
 }
 
+func TestWebVideoIsAvailableForBasicTier(t *testing.T) {
+	tierOrder := (&Adapter{}).TierOrder("grok-imagine-video")
+	if !slices.Equal(tierOrder, []account.WebTier{account.WebTierBasic, account.WebTierSuper, account.WebTierHeavy}) {
+		t.Fatalf("tier order for grok-imagine-video = %v", tierOrder)
+	}
+	for _, spec := range Catalog() {
+		if spec.PublicID == "grok-imagine-video" && spec.MinimumTier != account.WebTierBasic {
+			t.Fatalf("video minimum tier = %s, want basic", spec.MinimumTier)
+		}
+	}
+}
+
 func TestConsumeUpstreamChatFixture(t *testing.T) {
 	fixture := strings.Join([]string{
 		`data: {"result":{"conversation":{"conversationId":"conv_1"}}}`,
